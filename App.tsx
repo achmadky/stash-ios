@@ -11,87 +11,134 @@ import {
   Platform,
   SafeAreaView,
   Alert,
-  Keyboard
+  Keyboard,
+  ActivityIndicator,
+  RefreshControl
 } from 'react-native';
 import { Search, Plus, X, Trash2, Edit2 } from 'lucide-react-native';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
 
-// Types
-interface Stash {
-  id: string;
-  name: string;
-  location: string;
-  createdAt: number;
-}
+// Services & Store
+import { stashService } from './src/services/stash.service';
+import { useAppStore } from './src/store/useAppStore';
+import { Stash } from './src/types/stash';
 
 export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isModalVisible, setIsModalVisible] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newLocation, setNewLocation] = useState('');
+  const [newContent, setNewContent] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
-  
-  const [stashes, setStashes] = useState<Stash[]>([
-    { id: '1', name: 'passport', location: 'drawer', createdAt: Date.now() - 100000 },
-    { id: '2', name: 'wallet', location: 'shelf', createdAt: Date.now() - 200000 },
-    { id: '3', name: 'charger', location: 'backpack', createdAt: Date.now() - 300000 },
-  ]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [stashes, setStashes] = useState<Stash[]>([]);
 
-  const nameInputRef = useRef<TextInput>(null);
-  const locationInputRef = useRef<TextInput>(null);
+  const initializeDeviceId = useAppStore(state => state.initializeDeviceId);
+  const inputRef = useRef<TextInput>(null);
+
+  // Initialize App
+  useEffect(() => {
+    const init = async () => {
+      await initializeDeviceId();
+      loadStashes();
+    };
+    init();
+  }, []);
+
+  // Handle Search Debounce
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (searchQuery.trim()) {
+        performSearch();
+      } else {
+        loadStashes();
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   // Auto-focus keyboard when modal opens
   useEffect(() => {
     if (isModalVisible) {
       const timer = setTimeout(() => {
-        nameInputRef.current?.focus();
+        inputRef.current?.focus();
       }, 100);
       return () => clearTimeout(timer);
     }
   }, [isModalVisible]);
 
+  const loadStashes = async () => {
+    try {
+      setIsLoading(true);
+      const response = await stashService.getRecentStashes();
+      if (response.success) {
+        setStashes(response.data);
+      }
+    } catch (error) {
+      console.error('Failed to load stashes:', error);
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  };
+
+  const performSearch = async () => {
+    try {
+      setIsLoading(true);
+      const response = await stashService.searchStashes(searchQuery);
+      if (response.success) {
+        setStashes(response.data);
+      }
+    } catch (error) {
+      console.error('Search failed:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const onRefresh = () => {
+    setIsRefreshing(true);
+    loadStashes();
+  };
+
   const openCreateModal = () => {
     setEditingId(null);
-    setNewName('');
-    setNewLocation('');
+    setNewContent('');
     setIsModalVisible(true);
   };
 
   const openEditModal = (stash: Stash) => {
     setEditingId(stash.id);
-    setNewName(stash.name);
-    setNewLocation(stash.location);
+    setNewContent(stash.content);
     setIsModalVisible(true);
   };
 
-  const handleSave = () => {
-    if (newName.trim()) {
+  const handleSave = async () => {
+    if (!newContent.trim()) return;
+
+    try {
+      setIsLoading(true);
       if (editingId) {
-        // Update existing
-        setStashes(stashes.map(s => 
-          s.id === editingId 
-            ? { ...s, name: newName.trim(), location: newLocation.trim() } 
-            : s
-        ));
+        const response = await stashService.updateStash(editingId, { content: newContent.trim() });
+        if (response.success) {
+          setStashes(stashes.map(s => s.id === editingId ? response.data : s));
+        }
       } else {
-        // Create new
-        const newStash: Stash = {
-          id: Math.random().toString(36).substring(7),
-          name: newName.trim(),
-          location: newLocation.trim(),
-          createdAt: Date.now(),
-        };
-        setStashes([newStash, ...stashes]);
+        const response = await stashService.createStash({ content: newContent.trim() });
+        if (response.success) {
+          setStashes([response.data, ...stashes]);
+        }
       }
-      
       closeModal();
+    } catch (error) {
+      Alert.alert('Error', 'Couldn’t save stash. Try again.');
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const closeModal = () => {
     setIsModalVisible(false);
-    setNewName('');
-    setNewLocation('');
+    setNewContent('');
     setEditingId(null);
     Keyboard.dismiss();
   };
@@ -105,8 +152,15 @@ export default function App() {
         { 
           text: "Delete", 
           style: "destructive", 
-          onPress: () => {
-            setStashes(stashes.filter(s => s.id !== id));
+          onPress: async () => {
+            try {
+              const response = await stashService.deleteStash(id);
+              if (response.success) {
+                setStashes(stashes.filter(s => s.id !== id));
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Couldn’t delete stash.');
+            }
           } 
         }
       ]
@@ -116,15 +170,14 @@ export default function App() {
   const renderStashItem = ({ item }: { item: Stash }) => (
     <View style={styles.stashItem}>
       <View style={styles.stashInfo}>
-        <Text style={styles.stashName}>{item.name}</Text>
-        {item.location ? <Text style={styles.stashLocation}>{item.location}</Text> : null}
+        <Text style={styles.stashName}>{item.content}</Text>
       </View>
       <View style={styles.stashActions}>
         <TouchableOpacity onPress={() => openEditModal(item)} style={styles.actionButton}>
-          <Edit2 size={18} color="#8E8E93" />
+          <Edit2/>
         </TouchableOpacity>
         <TouchableOpacity onPress={() => handleDelete(item.id)} style={styles.actionButton}>
-          <Trash2 size={18} color="#FF3B30" />
+          <Trash2/>
         </TouchableOpacity>
       </View>
     </View>
@@ -139,9 +192,9 @@ export default function App() {
         <Text style={styles.title}>Stash.</Text>
       </View>
 
-      {/* Search Bar - Primary Action */}
+      {/* Search Bar */}
       <View style={styles.searchContainer}>
-        <Search size={20} color="#8E8E93" style={styles.searchIcon} />
+        <Search/>
         <TextInput
           style={styles.searchInput}
           placeholder="Search anything"
@@ -151,6 +204,9 @@ export default function App() {
           autoCorrect={false}
           autoCapitalize="none"
         />
+        {isLoading && searchQuery.length > 0 && (
+          <ActivityIndicator size="small" color="#8E8E93" />
+        )}
       </View>
 
       {/* List Container */}
@@ -159,18 +215,20 @@ export default function App() {
           {searchQuery ? 'Search Results' : 'Recent'}
         </Text>
         <FlatList
-          data={stashes.filter((s: Stash) => 
-            s.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-            s.location.toLowerCase().includes(searchQuery.toLowerCase())
-          )}
-          keyExtractor={(item: Stash) => item.id}
+          data={stashes}
+          keyExtractor={(item) => item.id}
           renderItem={renderStashItem}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#8E8E93" />
+          }
           ListEmptyComponent={
-            <View style={styles.emptyContainer}>
-              <Text style={styles.emptyText}>No stashes found</Text>
-            </View>
+            !isLoading ? (
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>No stashes found</Text>
+              </View>
+            ) : null
           }
         />
       </View>
@@ -181,7 +239,7 @@ export default function App() {
         onPress={openCreateModal}
         activeOpacity={0.7}
       >
-        <Plus size={24} color="#000" strokeWidth={1.5} />
+        <Plus/>
       </TouchableOpacity>
 
       {/* Create/Edit Modal */}
@@ -204,48 +262,34 @@ export default function App() {
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Where is it?</Text>
                 <TouchableOpacity onPress={closeModal}>
-                  <X size={20} color="#8E8E93" />
+                  <X/>
                 </TouchableOpacity>
               </View>
               
-              <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Item Name</Text>
-                <TextInput
-                  ref={nameInputRef}
-                  style={styles.modalInput}
-                  placeholder="passport"
-                  placeholderTextColor="#C7C7CC"
-                  value={newName}
-                  onChangeText={setNewName}
-                  returnKeyType="next"
-                  onSubmitEditing={() => locationInputRef.current?.focus()}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                />
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Location</Text>
-                <TextInput
-                  ref={locationInputRef}
-                  style={styles.modalInput}
-                  placeholder="drawer"
-                  placeholderTextColor="#C7C7CC"
-                  value={newLocation}
-                  onChangeText={setNewLocation}
-                  returnKeyType="done"
-                  onSubmitEditing={handleSave}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                />
-              </View>
+              <TextInput
+                ref={inputRef}
+                style={styles.modalInput}
+                placeholder="passport in blue drawer"
+                placeholderTextColor="#C7C7CC"
+                value={newContent}
+                onChangeText={setNewContent}
+                onSubmitEditing={handleSave}
+                returnKeyType="done"
+                autoCorrect={false}
+                autoCapitalize="none"
+                multiline
+              />
 
               <TouchableOpacity 
-                style={[styles.saveButton, !newName.trim() && styles.saveButtonDisabled]} 
+                style={[styles.saveButton, !newContent.trim() && styles.saveButtonDisabled]} 
                 onPress={handleSave}
-                disabled={!newName.trim()}
+                disabled={!newContent.trim() || isLoading}
               >
-                <Text style={styles.saveButtonText}>{editingId ? 'Update' : 'Save'}</Text>
+                {isLoading ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.saveButtonText}>{editingId ? 'Update' : 'Save'}</Text>
+                )}
               </TouchableOpacity>
             </TouchableOpacity>
           </KeyboardAvoidingView>
@@ -322,10 +366,6 @@ const styles = StyleSheet.create({
     marginBottom: 2,
     fontWeight: '500',
   },
-  stashLocation: {
-    fontSize: 15,
-    color: '#8E8E93',
-  },
   stashActions: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -378,22 +418,14 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#000000',
   },
-  inputGroup: {
-    marginBottom: 20,
-  },
-  inputLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#8E8E93',
-    marginBottom: 8,
-    textTransform: 'uppercase',
-  },
   modalInput: {
-    fontSize: 18,
+    fontSize: 20,
     color: '#000000',
     paddingVertical: 12,
+    marginBottom: 24,
     borderBottomWidth: 1,
     borderBottomColor: '#F2F2F7',
+    minHeight: 100,
   },
   saveButton: {
     backgroundColor: '#000000',
@@ -401,7 +433,6 @@ const styles = StyleSheet.create({
     height: 54,
     justifyContent: 'center',
     alignItems: 'center',
-    marginTop: 12,
   },
   saveButtonDisabled: {
     backgroundColor: '#F2F2F7',

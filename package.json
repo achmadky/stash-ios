@@ -9,13 +9,19 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@types/uuid": "^10.0.0",
+    "axios": "^1.16.1",
     "expo": "~51.0.0",
+    "expo-blur": "~13.0.2",
+    "expo-font": "~12.0.5",
+    "expo-secure-store": "^55.0.14",
     "expo-status-bar": "~1.12.1",
+    "lucide-react-native": "^0.378.0",
     "react": "18.2.0",
     "react-native": "0.74.5",
-    "lucide-react-native": "^0.378.0",
-    "expo-font": "~12.0.5",
-    "expo-blur": "~13.0.2"
+    "react-native-svg": "^15.15.5",
+    "uuid": "^14.0.0",
+    "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0",

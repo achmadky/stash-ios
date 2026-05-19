@@ -7,6 +7,7 @@ yarn-debug.log*
 yarn-error.log*
 .expo-shared/
 web-build/
+.npm-cache-api
 
 # Native
 ios/
