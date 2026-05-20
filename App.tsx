@@ -1,3 +1,23 @@
+/**
+ * App.tsx
+ * 
+ * Purpose:
+ * This is the main entry point of the Stash Mobile application. 
+ * It acts as the "orchestrator" for the Home screen, managing the search UI, 
+ * the list of stashes, and the creation/editing modal.
+ * 
+ * Responsibilities:
+ * - App initialization (Device ID setup).
+ * - State management for search and local data display.
+ * - Coordinating API calls via the Service layer.
+ * - Rendering the primary UI components and modals.
+ * 
+ * Learning Note:
+ * In a larger app, this file would be broken down into multiple screens using 
+ * a navigation library (like React Navigation). For this "search-first" MVP, 
+ * we keep it unified for speed and simplicity.
+ */
+
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   StyleSheet, 
@@ -18,45 +38,72 @@ import {
 import { Search, Plus, X, Trash2, Edit2 } from 'lucide-react-native';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
 
-// Services & Store
+// Layered Architecture: 
+// We import our data logic from services and store rather than calling axios directly.
+// This keeps our UI code "clean" and focused only on how things look.
 import { stashService } from './src/services/stash.service';
 import { useAppStore } from './src/store/useAppStore';
 import { Stash } from './src/types/stash';
 
 export default function App() {
+  // --- UI State ---
+  // searchQuery: Holds the text currently typed in the search bar.
   const [searchQuery, setSearchQuery] = useState('');
+  // isModalVisible: Controls the visibility of the "Where is it?" popup.
   const [isModalVisible, setIsModalVisible] = useState(false);
+  // newContent: Temporary storage for the text being typed in the create/edit modal.
   const [newContent, setNewContent] = useState('');
+  // editingId: If null, the modal is in "Create" mode. If it has a UUID, we are "Editing".
   const [editingId, setEditingId] = useState<string | null>(null);
+  
+  // --- Data State ---
+  // isLoading: Shows a spinner when we are waiting for the backend.
   const [isLoading, setIsLoading] = useState(false);
+  // isRefreshing: Specifically for the "Pull-to-Refresh" interaction.
   const [isRefreshing, setIsRefreshing] = useState(false);
+  // stashes: The actual array of data we received from the API.
   const [stashes, setStashes] = useState<Stash[]>([]);
 
+  // --- Logic & Hooks ---
+  // We pull the initialization function from our Zustand store.
   const initializeDeviceId = useAppStore(state => state.initializeDeviceId);
+  // Ref for the modal input so we can programmatically focus the keyboard.
   const inputRef = useRef<TextInput>(null);
 
-  // Initialize App
+  /**
+   * App Initialization
+   * Runs once when the component mounts.
+   * We must ensure the Device ID exists before making any stash requests.
+   */
   useEffect(() => {
     const init = async () => {
       await initializeDeviceId();
-      loadStashes();
+      loadStashes(); // Fetch initial data
     };
     init();
   }, []);
 
-  // Handle Search Debounce
+  /**
+   * Search Debounce Flow
+   * We don't want to hit the API on every single keystroke (it's expensive).
+   * Instead, we wait for 300ms of "silence" before triggering the search call.
+   */
   useEffect(() => {
     const timer = setTimeout(() => {
       if (searchQuery.trim()) {
         performSearch();
       } else {
-        loadStashes();
+        loadStashes(); // If search is cleared, show recent items again.
       }
     }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery]);
 
-  // Auto-focus keyboard when modal opens
+  /**
+   * Modal Auto-Focus
+   * UX Trick: When the modal slides up, we wait 100ms for the animation 
+   * to settle before forcing the keyboard to open.
+   */
   useEffect(() => {
     if (isModalVisible) {
       const timer = setTimeout(() => {
@@ -66,6 +113,12 @@ export default function App() {
     }
   }, [isModalVisible]);
 
+  // --- API Interaction Handlers ---
+
+  /**
+   * loadStashes
+   * Fetches the 20 most recent items for this device.
+   */
   const loadStashes = async () => {
     try {
       setIsLoading(true);
@@ -81,6 +134,10 @@ export default function App() {
     }
   };
 
+  /**
+   * performSearch
+   * Calls the specialized search endpoint on the backend.
+   */
   const performSearch = async () => {
     try {
       setIsLoading(true);
@@ -95,36 +152,38 @@ export default function App() {
     }
   };
 
+  /**
+   * onRefresh
+   * Triggered by the user pulling down the list.
+   */
   const onRefresh = () => {
     setIsRefreshing(true);
     loadStashes();
   };
 
-  const openCreateModal = () => {
-    setEditingId(null);
-    setNewContent('');
-    setIsModalVisible(true);
-  };
-
-  const openEditModal = (stash: Stash) => {
-    setEditingId(stash.id);
-    setNewContent(stash.content);
-    setIsModalVisible(true);
-  };
-
+  /**
+   * handleSave
+   * Handles both Creating a new stash and Updating an existing one.
+   * This logic is "optimistic" in spirit but waits for API confirmation 
+   * to ensure data integrity.
+   */
   const handleSave = async () => {
     if (!newContent.trim()) return;
 
     try {
       setIsLoading(true);
       if (editingId) {
+        // Mode: Update
         const response = await stashService.updateStash(editingId, { content: newContent.trim() });
         if (response.success) {
+          // Update the item in our local array without a full re-fetch.
           setStashes(stashes.map(s => s.id === editingId ? response.data : s));
         }
       } else {
+        // Mode: Create
         const response = await stashService.createStash({ content: newContent.trim() });
         if (response.success) {
+          // Prepend the new item to the top of our local list.
           setStashes([response.data, ...stashes]);
         }
       }
@@ -136,13 +195,11 @@ export default function App() {
     }
   };
 
-  const closeModal = () => {
-    setIsModalVisible(false);
-    setNewContent('');
-    setEditingId(null);
-    Keyboard.dismiss();
-  };
-
+  /**
+   * handleDelete
+   * Asks for confirmation before calling the DELETE endpoint.
+   * Soft-deletion happens on the backend, but we remove it from the UI immediately.
+   */
   const handleDelete = (id: string) => {
     Alert.alert(
       "Delete Stash",
@@ -167,6 +224,33 @@ export default function App() {
     );
   };
 
+  // --- Modal Helpers ---
+
+  const openCreateModal = () => {
+    setEditingId(null);
+    setNewContent('');
+    setIsModalVisible(true);
+  };
+
+  const openEditModal = (stash: Stash) => {
+    setEditingId(stash.id);
+    setNewContent(stash.content);
+    setIsModalVisible(true);
+  };
+
+  const closeModal = () => {
+    setIsModalVisible(false);
+    setNewContent('');
+    setEditingId(null);
+    Keyboard.dismiss();
+  };
+
+  // --- Render Helpers ---
+
+  /**
+   * renderStashItem
+   * Defines how a single row in our list looks.
+   */
   const renderStashItem = ({ item }: { item: Stash }) => (
     <View style={styles.stashItem}>
       <View style={styles.stashInfo}>
@@ -174,10 +258,10 @@ export default function App() {
       </View>
       <View style={styles.stashActions}>
         <TouchableOpacity onPress={() => openEditModal(item)} style={styles.actionButton}>
-          <Edit2/>
+          <Edit2 size={18} color="#8E8E93" />
         </TouchableOpacity>
         <TouchableOpacity onPress={() => handleDelete(item.id)} style={styles.actionButton}>
-          <Trash2/>
+          <Trash2 size={18} color="#FF3B30" />
         </TouchableOpacity>
       </View>
     </View>
@@ -187,14 +271,14 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <ExpoStatusBar style="auto" />
       
-      {/* Header */}
+      {/* Header: Centered and conversational to set a calm mood */}
       <View style={styles.header}>
-        <Text style={styles.title}>Stash.</Text>
+        <Text style={styles.title}>Stash</Text>
       </View>
 
-      {/* Search Bar */}
+      {/* Search Bar: The primary interaction point for "Search-First" UX */}
       <View style={styles.searchContainer}>
-        <Search/>
+        <Search size={20} color="#8E8E93" style={styles.searchIcon} />
         <TextInput
           style={styles.searchInput}
           placeholder="Search anything"
@@ -204,12 +288,13 @@ export default function App() {
           autoCorrect={false}
           autoCapitalize="none"
         />
+        {/* Inline loader inside search bar for immediate feedback */}
         {isLoading && searchQuery.length > 0 && (
           <ActivityIndicator size="small" color="#8E8E93" />
         )}
       </View>
 
-      {/* List Container */}
+      {/* List Section: Recent items or Search results */}
       <View style={styles.listContainer}>
         <Text style={styles.sectionTitle}>
           {searchQuery ? 'Search Results' : 'Recent'}
@@ -233,16 +318,16 @@ export default function App() {
         />
       </View>
 
-      {/* Minimal FAB */}
+      {/* FAB (Floating Add Button): Minimal and monochrome to avoid visual noise */}
       <TouchableOpacity 
         style={styles.fab} 
         onPress={openCreateModal}
         activeOpacity={0.7}
       >
-        <Plus/>
+        <Plus size={24} color="#000" strokeWidth={1.5} />
       </TouchableOpacity>
 
-      {/* Create/Edit Modal */}
+      {/* Create/Edit Modal: Uses conversational "Where is it?" prompt */}
       <Modal
         animationType="slide"
         transparent={true}
@@ -262,7 +347,7 @@ export default function App() {
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Where is it?</Text>
                 <TouchableOpacity onPress={closeModal}>
-                  <X/>
+                  <X size={20} color="#8E8E93" />
                 </TouchableOpacity>
               </View>
               
@@ -277,7 +362,7 @@ export default function App() {
                 returnKeyType="done"
                 autoCorrect={false}
                 autoCapitalize="none"
-                multiline
+                multiline // Allows for longer descriptions if needed
               />
 
               <TouchableOpacity 
@@ -299,6 +384,9 @@ export default function App() {
   );
 }
 
+// --- Styles ---
+// We follow Apple's Human Interface Guidelines for spacing and colors.
+// Using System Gray shades (#8E8E93, #F2F2F7) for a "native" iOS feel.
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -347,7 +435,7 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   listContent: {
-    paddingBottom: 100,
+    paddingBottom: 100, // Extra space so the FAB doesn't cover the last item.
   },
   stashItem: {
     flexDirection: 'row',
@@ -384,6 +472,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     alignItems: 'center',
+    // Soft shadow for depth without "Material Design" harshness.
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.08,
@@ -394,7 +483,7 @@ const styles = StyleSheet.create({
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    backgroundColor: 'rgba(0, 0, 0, 0.4)', // Dimmed background to focus on the modal.
     justifyContent: 'flex-end',
   },
   modalContentWrapper: {
@@ -425,7 +514,7 @@ const styles = StyleSheet.create({
     marginBottom: 24,
     borderBottomWidth: 1,
     borderBottomColor: '#F2F2F7',
-    minHeight: 100,
+    minHeight: 100, // Large typing area for better mobile ergonomics.
   },
   saveButton: {
     backgroundColor: '#000000',
