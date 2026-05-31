@@ -2,20 +2,18 @@
  * App.tsx
  * 
  * Purpose:
- * This is the main entry point of the Stash Mobile application. 
- * It acts as the "orchestrator" for the Home screen, managing the search UI, 
- * the list of stashes, and the creation/editing modal.
+ * This is the main orchestrator of the Stash Mobile application. 
+ * It manages search inputs, recent stashes list, and coordinates both 
+ * standard text composer and voice recorder inputs.
  * 
  * Responsibilities:
- * - App initialization (Device ID setup).
- * - State management for search and local data display.
- * - Coordinating API calls via the Service layer.
- * - Rendering the primary UI components and modals.
- * 
- * Learning Note:
- * In a larger app, this file would be broken down into multiple screens using 
- * a navigation library (like React Navigation). For this "search-first" MVP, 
- * we keep it unified for speed and simplicity.
+ * - App initialization (load device identity).
+ * - Instant client-side search.
+ * - Swipe-to-delete with custom PanResponder.
+ * - Undo deletion with a 3-second buffer.
+ * - Capture button gesture recognition (Tap vs Hold).
+ * - Simulated voice recording and speech-to-text.
+ * - Long-press detail sheet with auto-save check on close.
  */
 
 import React, { useState, useRef, useEffect } from 'react';
@@ -30,352 +28,685 @@ import {
   KeyboardAvoidingView, 
   Platform,
   SafeAreaView,
-  Alert,
   Keyboard,
   ActivityIndicator,
-  RefreshControl
+  RefreshControl,
+  Animated,
+  PanResponder,
+  Pressable
 } from 'react-native';
-import { Search, Plus, X, Trash2, Edit2 } from 'lucide-react-native';
+import { Search, Plus, X, Mic, AlertCircle, CheckCircle } from 'lucide-react-native';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
 
-// Layered Architecture: 
-// We import our data logic from services and store rather than calling axios directly.
-// This keeps our UI code "clean" and focused only on how things look.
+// Layered Architecture: Import data logic from services/stores.
 import { stashService } from './src/services/stash.service';
 import { useAppStore } from './src/store/useAppStore';
 import { Stash } from './src/types/stash';
 
+// List of realistic stashes to simulate speech-to-text transcription.
+const MOCK_VOICE_STASHES = [
+  "passport in second drawer",
+  "MacBook charger near TV cabinet",
+  "Gym gloves inside car trunk",
+  "car keys in the jacket pocket",
+  "wallet on the work desk",
+  "spare glasses in bedside cabinet",
+  "house keys on the kitchen counter",
+  "headphones inside the gray backpack"
+];
+
+// Custom swipe-to-delete item wrapper using native Animated + PanResponder.
+interface SwipeableItemProps {
+  item: Stash;
+  onDelete: (id: string) => void;
+  onLongPress: (item: Stash) => void;
+}
+
+const SwipeableItem: React.FC<SwipeableItemProps> = ({ item, onDelete, onLongPress }) => {
+  const translateX = useRef(new Animated.Value(0)).current;
+
+  // Set up PanResponder to only trigger on horizontal swipe-left gestures.
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_, gestureState) => {
+        // Only capture horizontal movements going left (negative dx)
+        return gestureState.dx < -15 && Math.abs(gestureState.dy) < 10;
+      },
+      onPanResponderMove: (_, gestureState) => {
+        // Only allow swiping to the left
+        if (gestureState.dx < 0) {
+          translateX.setValue(gestureState.dx);
+        }
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        if (gestureState.dx < -120) {
+          // Swipe threshold exceeded: animate offscreen and call delete handler.
+          Animated.timing(translateX, {
+            toValue: -500,
+            duration: 200,
+            useNativeDriver: true,
+          }).start(() => {
+            onDelete(item.id);
+          });
+        } else {
+          // Bounce back to original position.
+          Animated.spring(translateX, {
+            toValue: 0,
+            friction: 5,
+            useNativeDriver: true,
+          }).start();
+        }
+      },
+      onPanResponderTerminate: () => {
+        // Reset position on gesture cancellation.
+        Animated.spring(translateX, {
+          toValue: 0,
+          friction: 5,
+          useNativeDriver: true,
+        }).start();
+      }
+    })
+  ).current;
+
+  return (
+    <View style={styles.swipeContainer}>
+      {/* Background delete action view */}
+      <View style={styles.deleteBackground}>
+        <Text style={styles.deleteText}>Delete</Text>
+      </View>
+      
+      {/* Foreground container that receives gestures */}
+      <Animated.View
+        {...panResponder.panHandlers}
+        style={[
+          styles.swipeFront,
+          { transform: [{ translateX }] }
+        ]}
+      >
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onLongPress={() => onLongPress(item)}
+          style={styles.itemTouchable}
+        >
+          <View style={styles.stashInfo}>
+            <Text numberOfLines={3} ellipsizeMode="tail" style={styles.stashName}>
+              {item.content}
+            </Text>
+            <Text style={styles.stashTime}>
+              {item.updated_at 
+                ? `Updated ${new Date(item.updated_at).toLocaleDateString()}`
+                : `Created ${new Date(item.created_at).toLocaleDateString()}`}
+            </Text>
+          </View>
+        </TouchableOpacity>
+      </Animated.View>
+    </View>
+  );
+};
+
 export default function App() {
-  // --- UI State ---
-  // searchQuery: Holds the text currently typed in the search bar.
+  // --- UI States ---
   const [searchQuery, setSearchQuery] = useState('');
-  // isModalVisible: Controls the visibility of the "Where is it?" popup.
-  const [isModalVisible, setIsModalVisible] = useState(false);
-  // newContent: Temporary storage for the text being typed in the create/edit modal.
-  const [newContent, setNewContent] = useState('');
-  // editingId: If null, the modal is in "Create" mode. If it has a UUID, we are "Editing".
-  const [editingId, setEditingId] = useState<string | null>(null);
   
-  // --- Data State ---
-  // isLoading: Shows a spinner when we are waiting for the backend.
+  // Typing Composer Modal States
+  const [isComposerVisible, setIsComposerVisible] = useState(false);
+  const [composerContent, setComposerContent] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Detail Sheet Modal States
+  const [isDetailVisible, setIsDetailVisible] = useState(false);
+  const [detailStash, setDetailStash] = useState<Stash | null>(null);
+  const [detailContent, setDetailContent] = useState('');
+
+  // Voice Recording States
+  const [isRecording, setIsRecording] = useState(false);
+  const pulseScale = useRef(new Animated.Value(1)).current;
+  const recordingTimer = useRef<NodeJS.Timeout | null>(null);
+  const touchStartTime = useRef<number>(0);
+
+  // Notification Banner States
+  const [bannerMessage, setBannerMessage] = useState<string | null>(null);
+  const [bannerType, setBannerType] = useState<'error' | 'success' | 'info' | null>(null);
+  const bannerTimeout = useRef<NodeJS.Timeout | null>(null);
+
+  // Undo Delete Buffer States
+  const [undoVisible, setUndoVisible] = useState(false);
+  const [lastDeletedStash, setLastDeletedStash] = useState<{ item: Stash; index: number } | null>(null);
+  const undoTimeout = useRef<NodeJS.Timeout | null>(null);
+
+  // --- Data States ---
   const [isLoading, setIsLoading] = useState(false);
-  // isRefreshing: Specifically for the "Pull-to-Refresh" interaction.
   const [isRefreshing, setIsRefreshing] = useState(false);
-  // stashes: The actual array of data we received from the API.
   const [stashes, setStashes] = useState<Stash[]>([]);
 
-  // --- Logic & Hooks ---
-  // We pull the initialization function from our Zustand store.
+  // Zustand stores device initialization
   const initializeDeviceId = useAppStore(state => state.initializeDeviceId);
-  // Ref for the modal input so we can programmatically focus the keyboard.
-  const inputRef = useRef<TextInput>(null);
+  const composerInputRef = useRef<TextInput>(null);
 
-  /**
-   * App Initialization
-   * Runs once when the component mounts.
-   * We must ensure the Device ID exists before making any stash requests.
-   */
+  // Load device and stashes on mount
   useEffect(() => {
     const init = async () => {
       await initializeDeviceId();
-      loadStashes(); // Fetch initial data
+      loadStashes();
     };
     init();
+    return () => {
+      if (bannerTimeout.current) clearTimeout(bannerTimeout.current);
+      if (undoTimeout.current) clearTimeout(undoTimeout.current);
+      if (recordingTimer.current) clearTimeout(recordingTimer.current);
+    };
   }, []);
 
-  /**
-   * Search Debounce Flow
-   * We don't want to hit the API on every single keystroke (it's expensive).
-   * Instead, we wait for 300ms of "silence" before triggering the search call.
-   */
+  // Pulse animation loop during voice recording hold
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (searchQuery.trim()) {
-        performSearch();
-      } else {
-        loadStashes(); // If search is cleared, show recent items again.
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
+    if (isRecording) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseScale, {
+            toValue: 1.3,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseScale, {
+            toValue: 1.0,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+        ])
+      ).start();
+    } else {
+      pulseScale.setValue(1);
+    }
+  }, [isRecording]);
 
-  /**
-   * Modal Auto-Focus
-   * UX Trick: When the modal slides up, we wait 100ms for the animation 
-   * to settle before forcing the keyboard to open.
-   */
+  // Autofocus the typing composer input when opened
   useEffect(() => {
-    if (isModalVisible) {
+    if (isComposerVisible) {
       const timer = setTimeout(() => {
-        inputRef.current?.focus();
+        composerInputRef.current?.focus();
       }, 100);
       return () => clearTimeout(timer);
     }
-  }, [isModalVisible]);
+  }, [isComposerVisible]);
 
-  // --- API Interaction Handlers ---
+  // Dynamic client-side case-insensitive search
+  const filteredStashes = stashes
+    .filter(stash => stash.content.toLowerCase().includes(searchQuery.toLowerCase()))
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
-  /**
-   * loadStashes
-   * Fetches the 20 most recent items for this device.
-   */
+  // Show premium visual feedback banner
+  const showBannerMessage = (message: string, type: 'error' | 'success' | 'info' = 'info') => {
+    setBannerMessage(message);
+    setBannerType(type);
+    if (bannerTimeout.current) clearTimeout(bannerTimeout.current);
+    bannerTimeout.current = setTimeout(() => {
+      setBannerMessage(null);
+      setBannerType(null);
+    }, 3000);
+  };
+
+  // --- API Handlers ---
+
   const loadStashes = async () => {
     try {
       setIsLoading(true);
       const response = await stashService.getRecentStashes();
       if (response.success) {
         setStashes(response.data);
+      } else {
+        showBannerMessage("Something went wrong. Please try again.", "error");
       }
     } catch (error) {
-      console.error('Failed to load stashes:', error);
+      showBannerMessage("Something went wrong. Please try again.", "error");
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
     }
   };
 
-  /**
-   * performSearch
-   * Calls the specialized search endpoint on the backend.
-   */
-  const performSearch = async () => {
-    try {
-      setIsLoading(true);
-      const response = await stashService.searchStashes(searchQuery);
-      if (response.success) {
-        setStashes(response.data);
-      }
-    } catch (error) {
-      console.error('Search failed:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  /**
-   * onRefresh
-   * Triggered by the user pulling down the list.
-   */
-  const onRefresh = () => {
+  const handleRefresh = () => {
     setIsRefreshing(true);
     loadStashes();
   };
 
-  /**
-   * handleSave
-   * Handles both Creating a new stash and Updating an existing one.
-   * This logic is "optimistic" in spirit but waits for API confirmation 
-   * to ensure data integrity.
-   */
-  const handleSave = async () => {
-    if (!newContent.trim()) return;
+  // Typing Composer Submission
+  const handleComposerSubmit = async () => {
+    const content = composerContent.trim();
+    if (!content || isSaving) return;
 
+    setIsSaving(true);
     try {
-      setIsLoading(true);
-      if (editingId) {
-        // Mode: Update
-        const response = await stashService.updateStash(editingId, { content: newContent.trim() });
-        if (response.success) {
-          // Update the item in our local array without a full re-fetch.
-          setStashes(stashes.map(s => s.id === editingId ? response.data : s));
-        }
+      const response = await stashService.createStash({ content });
+      if (response.success) {
+        setStashes(prev => [response.data, ...prev]);
+        closeComposer();
       } else {
-        // Mode: Create
-        const response = await stashService.createStash({ content: newContent.trim() });
-        if (response.success) {
-          // Prepend the new item to the top of our local list.
-          setStashes([response.data, ...stashes]);
-        }
+        showBannerMessage("Something went wrong. Please try again.", "error");
       }
-      closeModal();
     } catch (error) {
-      Alert.alert('Error', 'Couldn’t save stash. Try again.');
+      showBannerMessage("Something went wrong. Please try again.", "error");
     } finally {
-      setIsLoading(false);
+      setIsSaving(false);
     }
   };
 
-  /**
-   * handleDelete
-   * Asks for confirmation before calling the DELETE endpoint.
-   * Soft-deletion happens on the backend, but we remove it from the UI immediately.
-   */
-  const handleDelete = (id: string) => {
-    Alert.alert(
-      "Delete Stash",
-      "Are you sure you want to remove this item?",
-      [
-        { text: "Cancel", style: "cancel" },
-        { 
-          text: "Delete", 
-          style: "destructive", 
-          onPress: async () => {
-            try {
-              const response = await stashService.deleteStash(id);
-              if (response.success) {
-                setStashes(stashes.filter(s => s.id !== id));
-              }
-            } catch (error) {
-              Alert.alert('Error', 'Couldn’t delete stash.');
-            }
-          } 
+  // Optimistic Swipe-to-Delete Action
+  const handleDeleteStash = async (id: string) => {
+    const index = stashes.findIndex(s => s.id === id);
+    if (index === -1) return;
+
+    const targetItem = stashes[index];
+
+    // Optimistic UI update: Remove immediately
+    const updated = stashes.filter(s => s.id !== id);
+    setStashes(updated);
+
+    // Save state for possible Undo action
+    setLastDeletedStash({ item: targetItem, index });
+    setUndoVisible(true);
+
+    if (undoTimeout.current) clearTimeout(undoTimeout.current);
+    undoTimeout.current = setTimeout(() => {
+      setUndoVisible(false);
+      setLastDeletedStash(null);
+    }, 3000);
+
+    try {
+      const response = await stashService.deleteStash(id);
+      if (!response.success) {
+        throw new Error("Failed delete");
+      }
+    } catch (error) {
+      // Revert optimistic delete on server failure
+      setStashes(prev => {
+        const restored = [...prev];
+        restored.splice(index, 0, targetItem);
+        return restored;
+      });
+      setUndoVisible(false);
+      setLastDeletedStash(null);
+      showBannerMessage("Something went wrong. Please try again.", "error");
+    }
+  };
+
+  // Restore deleted stash via Undo toast
+  const handleUndoDelete = async () => {
+    if (!lastDeletedStash) return;
+
+    const { item, index } = lastDeletedStash;
+
+    // Remove Undo layout immediately
+    setUndoVisible(false);
+    if (undoTimeout.current) clearTimeout(undoTimeout.current);
+
+    // Restore locally first
+    setStashes(prev => {
+      const restored = [...prev];
+      restored.splice(index, 0, item);
+      return restored;
+    });
+
+    try {
+      // Re-create the item on the server
+      const response = await stashService.createStash({ content: item.content });
+      if (response.success) {
+        // Swap temp ID with the newly created backend ID
+        setStashes(prev => prev.map(s => s.id === item.id ? response.data : s));
+      } else {
+        throw new Error("Failed undo recreate");
+      }
+    } catch (error) {
+      showBannerMessage("Something went wrong. Please try again.", "error");
+    } finally {
+      setLastDeletedStash(null);
+    }
+  };
+
+  // Detail Sheet Auto-Save Logic on close
+  const handleDetailSheetClose = async () => {
+    if (!detailStash) {
+      setIsDetailVisible(false);
+      return;
+    }
+
+    const original = detailStash.content.trim();
+    const current = detailContent.trim();
+
+    setIsDetailVisible(false);
+
+    // Only update stash when content changes. This prevents unnecessary PATCH requests.
+    if (current !== original && current.length > 0) {
+      // Update locally immediately
+      const updated = stashes.map(s => 
+        s.id === detailStash.id ? { ...s, content: current, updated_at: new Date().toISOString() } : s
+      );
+      setStashes(updated);
+
+      try {
+        const response = await stashService.updateStash(detailStash.id, { content: current });
+        if (response.success) {
+          // Sync final item state from server
+          setStashes(prev => prev.map(s => s.id === detailStash.id ? response.data : s));
+        } else {
+          throw new Error("Update failed");
         }
-      ]
-    );
+      } catch (error) {
+        // Revert local changes on failure
+        loadStashes();
+        showBannerMessage("Something went wrong. Please try again.", "error");
+      }
+    }
+
+    setDetailStash(null);
+    setDetailContent('');
+  };
+
+  // Gesture Capture Press Action Handlers
+  const handleCapturePressIn = () => {
+    touchStartTime.current = Date.now();
+    if (recordingTimer.current) clearTimeout(recordingTimer.current);
+
+    // Start voice recording state if held past 250ms threshold.
+    recordingTimer.current = setTimeout(() => {
+      setIsRecording(true);
+    }, 250);
+  };
+
+  const handleCapturePressOut = () => {
+    if (recordingTimer.current) {
+      clearTimeout(recordingTimer.current);
+      recordingTimer.current = null;
+    }
+
+    const duration = Date.now() - touchStartTime.current;
+
+    if (duration < 250) {
+      // It's a short tap: Never starts recording. Open typing composer.
+      openComposer();
+    } else {
+      // It's a hold action.
+      if (duration < 500) {
+        // Cancel rule: Released before 500ms -> Cancel recording, reset UI, send no API request.
+        setIsRecording(false);
+        showBannerMessage("Recording cancelled", "info");
+      } else {
+        // Valid hold: Stop recording and trigger speech-to-text submission.
+        setIsRecording(false);
+        handleVoiceRecordingSubmit();
+      }
+    }
+  };
+
+  const handleVoiceRecordingSubmit = async () => {
+    // Select a random realistic physical item for speech-to-text simulation.
+    const randomIndex = Math.floor(Math.random() * MOCK_VOICE_STASHES.length);
+    const content = MOCK_VOICE_STASHES[randomIndex];
+
+    // Inform the user of transcribed voice input
+    showBannerMessage(`Transcribed: "${content}"`, "success");
+
+    try {
+      const response = await stashService.createStash({ content });
+      if (response.success) {
+        setStashes(prev => [response.data, ...prev]);
+      } else {
+        showBannerMessage("Something went wrong. Please try again.", "error");
+      }
+    } catch (error) {
+      showBannerMessage("Something went wrong. Please try again.", "error");
+    }
   };
 
   // --- Modal Helpers ---
 
-  const openCreateModal = () => {
-    setEditingId(null);
-    setNewContent('');
-    setIsModalVisible(true);
+  const openComposer = () => {
+    setComposerContent('');
+    setIsComposerVisible(true);
   };
 
-  const openEditModal = (stash: Stash) => {
-    setEditingId(stash.id);
-    setNewContent(stash.content);
-    setIsModalVisible(true);
-  };
-
-  const closeModal = () => {
-    setIsModalVisible(false);
-    setNewContent('');
-    setEditingId(null);
+  const closeComposer = () => {
+    setIsComposerVisible(false);
+    setComposerContent('');
     Keyboard.dismiss();
   };
 
-  // --- Render Helpers ---
-
-  /**
-   * renderStashItem
-   * Defines how a single row in our list looks.
-   */
-  const renderStashItem = ({ item }: { item: Stash }) => (
-    <View style={styles.stashItem}>
-      <View style={styles.stashInfo}>
-        <Text style={styles.stashName}>{item.content}</Text>
-      </View>
-      <View style={styles.stashActions}>
-        <TouchableOpacity onPress={() => openEditModal(item)} style={styles.actionButton}>
-          <Edit2 size={18} color="#8E8E93" />
-        </TouchableOpacity>
-        <TouchableOpacity onPress={() => handleDelete(item.id)} style={styles.actionButton}>
-          <Trash2 size={18} color="#FF3B30" />
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
+  const openDetailSheet = (stash: Stash) => {
+    setDetailStash(stash);
+    setDetailContent(stash.content);
+    setIsDetailVisible(true);
+  };
 
   return (
     <SafeAreaView style={styles.container}>
-      <ExpoStatusBar style="auto" />
-      
-      {/* Header: Centered and conversational to set a calm mood */}
+      <ExpoStatusBar style="dark" />
+
+      {/* Title Header */}
       <View style={styles.header}>
         <Text style={styles.title}>Stash</Text>
       </View>
 
-      {/* Search Bar: The primary interaction point for "Search-First" UX */}
+      {/* Error / Notification Banner */}
+      {bannerMessage && (
+        <View style={[
+          styles.banner,
+          bannerType === 'error' && styles.bannerError,
+          bannerType === 'success' && styles.bannerSuccess,
+          bannerType === 'info' && styles.bannerInfo,
+        ]}>
+          {bannerType === 'error' ? (
+            <AlertCircle size={18} color="#FF3B30" style={styles.bannerIcon} />
+          ) : (
+            <CheckCircle size={18} color={bannerType === 'success' ? '#34C759' : '#007AFF'} style={styles.bannerIcon} />
+          )}
+          <Text style={[
+            styles.bannerText,
+            bannerType === 'error' && styles.bannerTextError,
+            bannerType === 'success' && styles.bannerTextSuccess,
+            bannerType === 'info' && styles.bannerTextInfo,
+          ]}>
+            {bannerMessage}
+          </Text>
+        </View>
+      )}
+
+      {/* Search Input Box */}
       <View style={styles.searchContainer}>
-        <Search size={20} color="#8E8E93" style={styles.searchIcon} />
+        <Search size={18} color="#8E8E93" style={styles.searchIcon} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search anything"
+          placeholder="Search stash"
           placeholderTextColor="#8E8E93"
           value={searchQuery}
           onChangeText={setSearchQuery}
           autoCorrect={false}
           autoCapitalize="none"
+          clearButtonMode="while-editing"
         />
-        {/* Inline loader inside search bar for immediate feedback */}
-        {isLoading && searchQuery.length > 0 && (
-          <ActivityIndicator size="small" color="#8E8E93" />
+      </View>
+
+      {/* Main Stash List */}
+      <View style={styles.listContainer}>
+        {isLoading && stashes.length === 0 ? (
+          <View style={styles.centerContainer}>
+            <ActivityIndicator size="large" color="#000" />
+          </View>
+        ) : (
+          <FlatList
+            data={filteredStashes}
+            keyExtractor={(item) => item.id}
+            renderItem={({ item }) => (
+              <SwipeableItem
+                item={item}
+                onDelete={handleDeleteStash}
+                onLongPress={openDetailSheet}
+              />
+            )}
+            contentContainerStyle={styles.listContent}
+            showsVerticalScrollIndicator={false}
+            refreshControl={
+              <RefreshControl
+                refreshing={isRefreshing}
+                onRefresh={handleRefresh}
+                tintColor="#8E8E93"
+              />
+            }
+            ListEmptyComponent={
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>Hold to remember something.</Text>
+              </View>
+            }
+          />
         )}
       </View>
 
-      {/* List Section: Recent items or Search results */}
-      <View style={styles.listContainer}>
-        <Text style={styles.sectionTitle}>
-          {searchQuery ? 'Search Results' : 'Recent'}
-        </Text>
-        <FlatList
-          data={stashes}
-          keyExtractor={(item) => item.id}
-          renderItem={renderStashItem}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#8E8E93" />
-          }
-          ListEmptyComponent={
-            !isLoading ? (
-              <View style={styles.emptyContainer}>
-                <Text style={styles.emptyText}>No stashes found</Text>
-              </View>
-            ) : null
-          }
-        />
+      {/* Floating Undo Delete Action Toast */}
+      {undoVisible && (
+        <View style={styles.undoToast}>
+          <Text style={styles.undoText}>Deleted</Text>
+          <TouchableOpacity onPress={handleUndoDelete} style={styles.undoButton}>
+            <Text style={styles.undoButtonText}>Undo</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Capture Button: Pressable with Tap vs Hold bindings */}
+      <View style={styles.captureContainer}>
+        <Pressable
+          onPressIn={handleCapturePressIn}
+          onPressOut={handleCapturePressOut}
+          style={({ pressed }) => [
+            styles.captureButton,
+            pressed && styles.captureButtonPressed,
+            isRecording && styles.captureButtonRecording
+          ]}
+        >
+          {isRecording ? (
+            <Mic size={26} color="#FFFFFF" />
+          ) : (
+            <Plus size={26} color="#FFFFFF" />
+          )}
+        </Pressable>
       </View>
 
-      {/* FAB (Floating Add Button): Minimal and monochrome to avoid visual noise */}
-      <TouchableOpacity 
-        style={styles.fab} 
-        onPress={openCreateModal}
-        activeOpacity={0.7}
-      >
-        <Plus size={24} color="#000" strokeWidth={1.5} />
-      </TouchableOpacity>
+      {/* Voice Recording Pulse Overlay Screen */}
+      {isRecording && (
+        <View style={styles.recordingOverlay}>
+          <Animated.View style={[
+            styles.pulsingCircle,
+            { transform: [{ scale: pulseScale }] }
+          ]} />
+          <View style={styles.recordingCard}>
+            <Mic size={42} color="#FF3B30" style={styles.recordingMic} />
+            <Text style={styles.recordingText}>Listening...</Text>
+            <Text style={styles.recordingSubtext}>Release to save • Let go early to cancel</Text>
+          </View>
+        </View>
+      )}
 
-      {/* Create/Edit Modal: Uses conversational "Where is it?" prompt */}
+      {/* Typing Composer Bottom Sheet Modal */}
       <Modal
         animationType="slide"
         transparent={true}
-        visible={isModalVisible}
-        onRequestClose={closeModal}
+        visible={isComposerVisible}
+        onRequestClose={closeComposer}
       >
         <TouchableOpacity 
           style={styles.modalOverlay} 
           activeOpacity={1} 
-          onPress={closeModal}
+          onPress={closeComposer}
         >
           <KeyboardAvoidingView 
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             style={styles.modalContentWrapper}
           >
             <TouchableOpacity activeOpacity={1} style={styles.modalContent}>
+              <View style={styles.sheetHandle} />
+              
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Where is it?</Text>
-                <TouchableOpacity onPress={closeModal}>
+                <TouchableOpacity onPress={closeComposer}>
                   <X size={20} color="#8E8E93" />
                 </TouchableOpacity>
               </View>
               
               <TextInput
-                ref={inputRef}
+                ref={composerInputRef}
                 style={styles.modalInput}
-                placeholder="passport in blue drawer"
+                placeholder="passport in second drawer"
                 placeholderTextColor="#C7C7CC"
-                value={newContent}
-                onChangeText={setNewContent}
-                onSubmitEditing={handleSave}
+                value={composerContent}
+                onChangeText={setComposerContent}
+                onSubmitEditing={handleComposerSubmit}
                 returnKeyType="done"
                 autoCorrect={false}
                 autoCapitalize="none"
-                multiline // Allows for longer descriptions if needed
+                maxLength={180}
+                multiline
               />
 
-              <TouchableOpacity 
-                style={[styles.saveButton, !newContent.trim() && styles.saveButtonDisabled]} 
-                onPress={handleSave}
-                disabled={!newContent.trim() || isLoading}
-              >
-                {isLoading ? (
-                  <ActivityIndicator color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.saveButtonText}>{editingId ? 'Update' : 'Save'}</Text>
-                )}
-              </TouchableOpacity>
+              <View style={styles.composerFooter}>
+                <Text style={styles.charCounter}>{composerContent.length}/180</Text>
+                <TouchableOpacity 
+                  style={[styles.saveButton, !composerContent.trim() && styles.saveButtonDisabled]} 
+                  onPress={handleComposerSubmit}
+                  disabled={!composerContent.trim() || isSaving}
+                >
+                  {isSaving ? (
+                    <ActivityIndicator color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.saveButtonText}>Save</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          </KeyboardAvoidingView>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* Detail Sheet Bottom Modal */}
+      <Modal
+        animationType="slide"
+        transparent={true}
+        visible={isDetailVisible}
+        onRequestClose={handleDetailSheetClose}
+      >
+        <TouchableOpacity 
+          style={styles.modalOverlay} 
+          activeOpacity={1} 
+          onPress={handleDetailSheetClose}
+        >
+          <KeyboardAvoidingView 
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.modalContentWrapper}
+          >
+            <TouchableOpacity activeOpacity={1} style={styles.modalContent}>
+              <View style={styles.sheetHandle} />
+              
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Stash Detail</Text>
+                <TouchableOpacity onPress={handleDetailSheetClose}>
+                  <X size={20} color="#8E8E93" />
+                </TouchableOpacity>
+              </View>
+              
+              <TextInput
+                style={[styles.modalInput, styles.detailInput]}
+                placeholder="Content cannot be empty"
+                placeholderTextColor="#C7C7CC"
+                value={detailContent}
+                onChangeText={setDetailContent}
+                autoFocus
+                autoCorrect={false}
+                autoCapitalize="none"
+                maxLength={180}
+                multiline
+              />
+
+              <View style={styles.composerFooter}>
+                <Text style={styles.charCounter}>{detailContent.length}/180</Text>
+                <Text style={styles.autoSaveLabel}>Auto-saves on close</Text>
+              </View>
             </TouchableOpacity>
           </KeyboardAvoidingView>
         </TouchableOpacity>
@@ -384,9 +715,6 @@ export default function App() {
   );
 }
 
-// --- Styles ---
-// We follow Apple's Human Interface Guidelines for spacing and colors.
-// Using System Gray shades (#8E8E93, #F2F2F7) for a "native" iOS feel.
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -394,96 +722,247 @@ const styles = StyleSheet.create({
   },
   header: {
     paddingHorizontal: 24,
-    paddingTop: 60,
-    paddingBottom: 20,
+    paddingTop: Platform.OS === 'ios' ? 16 : 40,
+    paddingBottom: 8,
     alignItems: 'center',
   },
   title: {
-    fontSize: 28,
-    fontWeight: '600',
+    fontSize: 24,
+    fontWeight: '700',
     color: '#000000',
     letterSpacing: -0.5,
+  },
+  banner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 24,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+  },
+  bannerError: {
+    backgroundColor: '#FFF2F2',
+    borderColor: '#FFD1D1',
+  },
+  bannerSuccess: {
+    backgroundColor: '#F2FFF5',
+    borderColor: '#D1FFD9',
+  },
+  bannerInfo: {
+    backgroundColor: '#F2F8FF',
+    borderColor: '#D1E8FF',
+  },
+  bannerIcon: {
+    marginRight: 10,
+  },
+  bannerText: {
+    fontSize: 14,
+    fontWeight: '500',
+    flex: 1,
+  },
+  bannerTextError: {
+    color: '#FF3B30',
+  },
+  bannerTextSuccess: {
+    color: '#34C759',
+  },
+  bannerTextInfo: {
+    color: '#007AFF',
   },
   searchContainer: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#F2F2F7',
-    marginHorizontal: 32,
+    marginHorizontal: 24,
     paddingHorizontal: 16,
-    borderRadius: 14,
-    height: 52,
-    marginBottom: 40,
+    borderRadius: 12,
+    height: 48,
+    marginBottom: 16,
   },
   searchIcon: {
     marginRight: 8,
   },
   searchInput: {
     flex: 1,
-    fontSize: 17,
+    fontSize: 16,
     color: '#000000',
   },
   listContainer: {
     flex: 1,
     paddingHorizontal: 24,
   },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#8E8E93',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 16,
-  },
   listContent: {
-    paddingBottom: 100, // Extra space so the FAB doesn't cover the last item.
+    paddingBottom: 120,
   },
-  stashItem: {
-    flexDirection: 'row',
+  centerContainer: {
+    flex: 1,
+    justifyContent: 'center',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 16,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#C6C6C8',
+  },
+  swipeContainer: {
+    backgroundColor: '#FF3B30',
+    borderRadius: 16,
+    marginBottom: 12,
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  deleteBackground: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: 100,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  deleteText: {
+    color: '#FFFFFF',
+    fontWeight: '600',
+    fontSize: 15,
+  },
+  swipeFront: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E9ECEF',
+  },
+  itemTouchable: {
+    padding: 18,
+    width: '100%',
   },
   stashInfo: {
     flex: 1,
   },
   stashName: {
-    fontSize: 17,
-    color: '#000000',
-    marginBottom: 2,
+    fontSize: 16,
+    color: '#1A1D20',
     fontWeight: '500',
+    lineHeight: 22,
   },
-  stashActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  stashTime: {
+    fontSize: 12,
+    color: '#ADB5BD',
+    marginTop: 8,
+    fontWeight: '400',
   },
-  actionButton: {
-    padding: 8,
-    marginLeft: 8,
-  },
-  fab: {
+  captureContainer: {
     position: 'absolute',
-    bottom: 40,
-    right: 32,
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#FFFFFF',
+    bottom: 32,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  captureButton: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#000000',
     justifyContent: 'center',
     alignItems: 'center',
-    // Soft shadow for depth without "Material Design" harshness.
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 10,
+    elevation: 6,
+  },
+  captureButtonPressed: {
+    transform: [{ scale: 0.95 }],
+    backgroundColor: '#212529',
+  },
+  captureButtonRecording: {
+    backgroundColor: '#FF3B30',
+    transform: [{ scale: 1.1 }],
+  },
+  recordingOverlay: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 999,
+  },
+  pulsingCircle: {
+    position: 'absolute',
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: 'rgba(255, 59, 48, 0.25)',
+  },
+  recordingCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 32,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    elevation: 10,
+    width: '80%',
+  },
+  recordingMic: {
+    marginBottom: 16,
+  },
+  recordingText: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#212529',
+    marginBottom: 8,
+  },
+  recordingSubtext: {
+    fontSize: 12,
+    color: '#868E96',
+    textAlign: 'center',
+  },
+  undoToast: {
+    position: 'absolute',
+    bottom: 110,
+    left: 24,
+    right: 24,
+    backgroundColor: '#212529',
+    borderRadius: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
     shadowRadius: 8,
-    elevation: 3,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#E5E5EA',
+    elevation: 5,
+    zIndex: 100,
+  },
+  undoText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  undoButton: {
+    backgroundColor: '#495057',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+  },
+  undoButtonText: {
+    color: '#34C759',
+    fontWeight: '600',
+    fontSize: 14,
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.4)', // Dimmed background to focus on the modal.
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
     justifyContent: 'flex-end',
   },
   modalContentWrapper: {
@@ -493,50 +972,81 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
-    padding: 24,
-    paddingBottom: Platform.OS === 'ios' ? 40 : 24,
+    paddingHorizontal: 24,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 44 : 24,
+  },
+  sheetHandle: {
+    width: 40,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#DEE2E6',
+    alignSelf: 'center',
+    marginBottom: 16,
   },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 24,
+    marginBottom: 16,
   },
   modalTitle: {
-    fontSize: 20,
-    fontWeight: '600',
-    color: '#000000',
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1A1D20',
   },
   modalInput: {
-    fontSize: 20,
-    color: '#000000',
+    fontSize: 17,
+    color: '#1A1D20',
     paddingVertical: 12,
-    marginBottom: 24,
     borderBottomWidth: 1,
-    borderBottomColor: '#F2F2F7',
-    minHeight: 100, // Large typing area for better mobile ergonomics.
+    borderBottomColor: '#F1F3F5',
+    minHeight: 120,
+    textAlignVertical: 'top',
+    marginBottom: 12,
+    lineHeight: 24,
+  },
+  detailInput: {
+    minHeight: 160,
+  },
+  composerFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  charCounter: {
+    fontSize: 12,
+    color: '#ADB5BD',
+  },
+  autoSaveLabel: {
+    fontSize: 12,
+    color: '#34C759',
+    fontWeight: '600',
   },
   saveButton: {
     backgroundColor: '#000000',
-    borderRadius: 14,
-    height: 54,
-    justifyContent: 'center',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    minWidth: 80,
     alignItems: 'center',
   },
   saveButtonDisabled: {
-    backgroundColor: '#F2F2F7',
+    backgroundColor: '#E9ECEF',
   },
   saveButtonText: {
     color: '#FFFFFF',
-    fontSize: 17,
+    fontSize: 14,
     fontWeight: '600',
   },
   emptyContainer: {
-    paddingTop: 40,
+    paddingTop: 80,
     alignItems: 'center',
   },
   emptyText: {
     color: '#8E8E93',
     fontSize: 15,
+    fontWeight: '500',
   },
 });
